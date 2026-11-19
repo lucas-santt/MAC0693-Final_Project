@@ -93,6 +93,7 @@ public class User : MonoBehaviour
     private float initialWallScaleZ;
     private float currentMinZ;
     private float currentMaxZ;
+    private CeilingWalls currentCeiling; // se a parede segue um teto, esticá-la move o teto (e as outras paredes)
 
     // Controle de Movimentação no Chão (Moveable)
     private Plane grabHeightPlane;
@@ -328,6 +329,7 @@ public class User : MonoBehaviour
             initialControllerPos = rightControllerTransform.position;
             initialWallScaleZ = targetObject.localScale.z;
             FetchWallLimits(targetObject);
+            currentCeiling = CeilingWalls.FindFor(targetObject);
         }
         else
         {
@@ -383,6 +385,7 @@ public class User : MonoBehaviour
 
         targetObject = null;
         hoveredObject = null;
+        currentCeiling = null;
         currentMode = InteractionMode.None;
         ownColliders.Clear();
         initialPenetration.Clear();
@@ -403,8 +406,15 @@ public class User : MonoBehaviour
         float rawScaleZ = initialWallScaleZ - (forwardMovement * scaleSensitivity);
         float newScaleZ = Mathf.Clamp(rawScaleZ, currentMinZ, currentMaxZ);
 
-        Vector3 currentScale = targetObject.localScale;
-        targetObject.localScale = new Vector3(currentScale.x, currentScale.y, newScaleZ);
+        if (currentCeiling != null)
+        {
+            currentCeiling.SetHeightFromWall(targetObject, newScaleZ);
+        }
+        else
+        {
+            Vector3 currentScale = targetObject.localScale;
+            targetObject.localScale = new Vector3(currentScale.x, currentScale.y, newScaleZ);
+        }
     }
 
     // ---------- Movimentação e rotação de móveis ----------
