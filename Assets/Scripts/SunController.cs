@@ -34,11 +34,28 @@ public class SunController : MonoBehaviour
     [Tooltip("Horas simuladas por segundo real")]
     public float hoursPerSecond = 0.5f;
 
-    [Header("Controle em VR (opcional)")]
-    [Tooltip("Ação Vector2 (ex.: joystick do controle esquerdo). Eixo X avança/volta a hora.")]
+    [Header("Controle em VR (joystick)")]
+    [Tooltip("Ação Vector2. Se ficar vazia, usa automaticamente o joystick do controle ESQUERDO.")]
     public InputActionProperty timeScrubAction;
-    [Tooltip("Horas por segundo com o joystick totalmente inclinado")]
-    public float scrubSpeed = 2f;
+    [Tooltip("Desliga a locomoção contínua do template, que também usa o joystick esquerdo")]
+    public bool disableContinuousMove = true;
+
+    [Tooltip("Inclinação mínima do joystick para contar como toque")]
+    [Range(0.2f, 0.9f)] public float stickThreshold = 0.5f;
+    [Tooltip("Tempo segurando antes de começar a acelerar (s)")]
+    public float holdDelay = 0.35f;
+    [Tooltip("Tempo para chegar à velocidade máxima depois do atraso (s)")]
+    public float accelerationTime = 1.5f;
+
+    [Tooltip("Hora (←/→): cada toque avança/volta este tanto, em horas (0,25 = 15 min)")]
+    public float hourTapStep = 0.25f;
+    [Tooltip("Hora (←/→): velocidade máxima segurando, em horas por segundo")]
+    public float hourMaxSpeed = 2f;
+
+    [Tooltip("Data (↑/↓): cada toque avança/volta este tanto, em dias")]
+    public int dateTapStepDays = 7;
+    [Tooltip("Data (↑/↓): velocidade máxima segurando, em dias por segundo")]
+    public float dateMaxSpeedDays = 30f;
 
     [Header("Aparência")]
     [Tooltip("Intensidade com o sol no alto")]
@@ -57,12 +74,77 @@ public class SunController : MonoBehaviour
 
     private Light sun;
 
+    // Joystick
+    private InputAction ownScrubAction;          // criada quando nenhuma ação foi associada
+    private int heldAxis = -1;                   // -1 = solto, 0 = horizontal (hora), 1 = vertical (data)
+    private float heldSign;
+    private float heldTime;
+    private float pendingDays;                   // fração de dia acumulada ao segurar o joystick na data
+
+    /// <summary>Chamado sempre que hora ou data mudam (útil para um relógio de pulso).</summary>
+    public event Action<SunController> TimeChanged;
+
     void OnEnable()
     {
         sun = GetComponent<Light>();
-        if (timeScrubAction.action != null) timeScrubAction.action.Enable();
         if (RenderSettings.sun == null) RenderSettings.sun = sun;
+
+        if (Application.isPlaying)
+        {
+            SetupScrubAction();
+            if (disableContinuousMove) DisableContinuousMove();
+        }
+
         UpdateSun();
+    }
+
+    void OnDisable()
+    {
+        if (ownScrubAction != null)
+        {
+            ownScrubAction.Disable();
+            ownScrubAction.Dispose();
+            ownScrubAction = null;
+        }
+    }
+
+    private void SetupScrubAction()
+    {
+        InputAction assigned = timeScrubAction.action;
+        if (assigned != null && assigned.bindings.Count > 0)
+        {
+            assigned.Enable();
+            return;
+        }
+
+        // Nenhuma ação associada: joystick do controle esquerdo (qualquer controle XR)
+        ownScrubAction = new InputAction("Time Scrub", InputActionType.Value, expectedControlType: "Vector2");
+        ownScrubAction.AddBinding("<XRController>{LeftHand}/{Primary2DAxis}");
+        ownScrubAction.Enable();
+    }
+
+    private Vector2 ReadScrub()
+    {
+        if (ownScrubAction != null) return ownScrubAction.ReadValue<Vector2>();
+        InputAction a = timeScrubAction.action;
+        return a != null ? a.ReadValue<Vector2>() : Vector2.zero;
+    }
+
+    // O VR Template usa o joystick esquerdo para andar. O design usa só teleporte, então a locomoção
+    // contínua é desligada (por nome de tipo, para não depender da versão do XR Interaction Toolkit).
+    private static void DisableContinuousMove()
+    {
+        foreach (MonoBehaviour mb in FindObjectsByType<MonoBehaviour>(FindObjectsSortMode.None))
+        {
+            for (Type t = mb.GetType(); t != null && t != typeof(MonoBehaviour); t = t.BaseType)
+            {
+                if (t.Name == "ContinuousMoveProvider")
+                {
+                    mb.enabled = false;
+                    break;
+                }
+            }
+        }
     }
 
     void OnValidate()
@@ -76,20 +158,99 @@ public class SunController : MonoBehaviour
     {
         if (!Application.isPlaying) return;
 
-        float delta = 0f;
-        if (animate) delta += hoursPerSecond * Time.deltaTime;
+        bool changed = false;
 
-        if (timeScrubAction.action != null)
+        if (animate)
         {
-            Vector2 stick = timeScrubAction.action.ReadValue<Vector2>();
-            if (Mathf.Abs(stick.x) > 0.2f) delta += stick.x * scrubSpeed * Time.deltaTime;
+            AddHours(hoursPerSecond * Time.deltaTime);
+            changed = true;
         }
 
-        if (delta != 0f)
+        changed |= HandleStick(ReadScrub());
+
+        if (changed)
         {
-            timeOfDay = Mathf.Repeat(timeOfDay + delta, 24f);
             UpdateSun();
+            TimeChanged?.Invoke(this);
         }
+    }
+
+    // Toque curto = um passo; segurando, depois de um instante acelera até a velocidade máxima
+    private bool HandleStick(Vector2 stick)
+    {
+        int axis = -1;
+        if (Mathf.Max(Mathf.Abs(stick.x), Mathf.Abs(stick.y)) >= stickThreshold)
+        {
+            axis = Mathf.Abs(stick.x) >= Mathf.Abs(stick.y) ? 0 : 1;
+        }
+
+        if (axis < 0)
+        {
+            heldAxis = -1;
+            pendingDays = 0f;
+            return false;
+        }
+
+        float value = axis == 0 ? stick.x : stick.y;
+        float sign = Mathf.Sign(value);
+
+        // Começou um novo toque (ou mudou de eixo/sentido): aplica um passo
+        if (axis != heldAxis || sign != heldSign)
+        {
+            heldAxis = axis;
+            heldSign = sign;
+            heldTime = 0f;
+            pendingDays = 0f;
+
+            if (axis == 0) AddHours(sign * hourTapStep);
+            else AddDays(Mathf.RoundToInt(sign) * dateTapStepDays);
+            return true;
+        }
+
+        heldTime += Time.deltaTime;
+        if (heldTime < holdDelay) return false;
+
+        float ramp = accelerationTime > 0f ? Mathf.Clamp01((heldTime - holdDelay) / accelerationTime) : 1f;
+        float strength = Mathf.InverseLerp(stickThreshold, 1f, Mathf.Abs(value));
+
+        if (axis == 0)
+        {
+            float speed = Mathf.Lerp(hourTapStep * 4f, hourMaxSpeed, ramp) * Mathf.Lerp(0.5f, 1f, strength);
+            AddHours(sign * speed * Time.deltaTime);
+            return true;
+        }
+
+        float daySpeed = Mathf.Lerp(dateTapStepDays * 2f, dateMaxSpeedDays, ramp) * Mathf.Lerp(0.5f, 1f, strength);
+        pendingDays += sign * daySpeed * Time.deltaTime;
+        int wholeDays = (int)pendingDays;
+        if (wholeDays == 0) return false;
+        pendingDays -= wholeDays;
+        AddDays(wholeDays);
+        return true;
+    }
+
+    /// <summary>Avança (ou volta, se negativo) o relógio; passar da meia-noite muda o dia.</summary>
+    public void AddHours(float hours)
+    {
+        float total = timeOfDay + hours;
+        int dayShift = Mathf.FloorToInt(total / 24f);
+        timeOfDay = total - dayShift * 24f;
+        if (dayShift != 0) AddDays(dayShift);
+    }
+
+    /// <summary>Avança (ou volta) a data em dias. O ano é ignorado: depois de 31/12 vem 1/1.</summary>
+    public void AddDays(int days)
+    {
+        DateTime date = new DateTime(2026, month, Mathf.Clamp(day, 1, DateTime.DaysInMonth(2026, month))).AddDays(days);
+        month = date.Month;
+        day = date.Day;
+    }
+
+    /// <summary>Texto pronto para mostrar na interface, ex.: "21/06 09:15".</summary>
+    public string GetDisplayText()
+    {
+        int totalMinutes = Mathf.RoundToInt(timeOfDay * 60f) % (24 * 60);
+        return $"{day:00}/{month:00}  {totalMinutes / 60:00}:{totalMinutes % 60:00}";
     }
 
     /// <summary>Muda a hora (ex.: por um botão ou slider na interface).</summary>
@@ -97,6 +258,7 @@ public class SunController : MonoBehaviour
     {
         timeOfDay = Mathf.Repeat(hour, 24f);
         UpdateSun();
+        TimeChanged?.Invoke(this);
     }
 
     /// <summary>Muda a data (ex.: solstício de verão = 21/12, de inverno = 21/6 no hemisfério sul).</summary>
@@ -105,6 +267,7 @@ public class SunController : MonoBehaviour
         month = Mathf.Clamp(newMonth, 1, 12);
         day = Mathf.Clamp(newDay, 1, DateTime.DaysInMonth(2026, month));
         UpdateSun();
+        TimeChanged?.Invoke(this);
     }
 
     public void UpdateSun()
